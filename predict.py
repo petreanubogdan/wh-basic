@@ -1,140 +1,166 @@
+import io
 import os
+from typing import Optional, Any
+import torch
+import numpy as np
+import cProfile
+import pstats
+from pstats import SortKey
+import time
 
 from cog import BasePredictor, Input, Path, BaseModel
-from faster_whisper import WhisperModel
-from faster_whisper.transcribe import Segment
-from typing import Iterable
-from typing import Any
-from whisper.tokenizer import LANGUAGES
 
-SUPPORTED_MODEL_NAMES = [
-    "large-v2"
-]
+import whisper
+from whisper.model import Whisper, ModelDimensions
+from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
+from whisper.utils import format_timestamp
 
 
 class ModelOutput(BaseModel):
+    detected_language: str
+    transcription: str
     segments: Any
-    preview: str
-    srt_file: Path
-    vtt_file: Path
+    translation: Optional[str]
+    txt_file: Optional[Path]
+    srt_file: Optional[Path]
 
 
 class Predictor(BasePredictor):
+    def setup(self):
+        """Loads whisper models into memory to make running multiple predictions efficient"""
+
+        with open(f"./weights/large-v2.pt", "rb") as fp:
+            checkpoint = torch.load(fp, map_location="cpu")
+            dims = ModelDimensions(**checkpoint["dims"])
+            self.model = Whisper(dims)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.model.to("cuda")
+
     def predict(
-            self,
-            audio_path: Path = Input(
-                description="Audio file to generate subtitles for.",
-            ),
-            model_name: str = Input(
-                default="large-v2",
-                choices=SUPPORTED_MODEL_NAMES,
-                description="Name of the Whisper model to use.",
-            ),
-            language: str = Input(
-                default="en",
-                choices=LANGUAGES.keys(),
-                description="Language of the audio.",
-            ),
-            vad_filter: bool = Input(
-                default=True,
-                description="Enable the voice activity detection (VAD) to filter out parts of the audio without speech.",
-            ),
+        self,
+        audio: Path = Input(description="Audio file"),
+        model: str = Input(
+            default="large-v2",
+            choices=["large-v2", ],
+            description="Choose a Whisper model.",
+        ),
+        transcription: str = Input(
+            choices=["plain text", "srt", "vtt"],
+            default="plain text",
+            description="Choose the format for the transcription",
+        ),
+        translate: bool = Input(
+            default=False,
+            description="Translate the text to English when set to True",
+        ),
+        language: str = Input(
+            choices=sorted(LANGUAGES.keys())
+            + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]),
+            default=None,
+            description="language spoken in the audio, specify None to perform language detection",
+        ),
+        temperature: float = Input(
+            default=0,
+            description="temperature to use for sampling",
+        ),
+        patience: float = Input(
+            default=None,
+            description="optional patience value to use in beam decoding, as in https://arxiv.org/abs/2204.05424, the default (1.0) is equivalent to conventional beam search",
+        ),
+        suppress_tokens: str = Input(
+            default="-1",
+            description="comma-separated list of token ids to suppress during sampling; '-1' will suppress most special characters except common punctuations",
+        ),
+        initial_prompt: str = Input(
+            default=None,
+            description="optional text to provide as a prompt for the first window.",
+        ),
+        condition_on_previous_text: bool = Input(
+            default=True,
+            description="if True, provide the previous output of the model as a prompt for the next window; disabling may make the text inconsistent across windows, but the model becomes less prone to getting stuck in a failure loop",
+        ),
+        temperature_increment_on_fallback: float = Input(
+            default=0.2,
+            description="temperature to increase when falling back when the decoding fails to meet either of the thresholds below",
+        ),
+        compression_ratio_threshold: float = Input(
+            default=2.4,
+            description="if the gzip compression ratio is higher than this value, treat the decoding as failed",
+        ),
+        logprob_threshold: float = Input(
+            default=-1.0,
+            description="if the average log probability is lower than this value, treat the decoding as failed",
+        ),
+        no_speech_threshold: float = Input(
+            default=0.6,
+            description="if the probability of the <|nospeech|> token is higher than this value AND the decoding has failed due to `logprob_threshold`, consider the segment as silence",
+        ),
+        word_timestamps: bool = Input(
+            default=True,
+            description="Improves the accuracy of the timestamps by using word-level timestamps",
+        )
     ) -> ModelOutput:
-        if model_name.endswith(".en") and language != "en":
-            print("English only model detected, forcing language to 'en'!")
-            language = "en"
+        """Transcribes and optionally translates a single audio file"""
+        print(f"Transcribe with {model} model")
+        model = self.model
+        if temperature_increment_on_fallback is not None:
+            temperature = tuple(
+                np.arange(temperature, 1.0 + 1e-6, temperature_increment_on_fallback)
+            )
+        else:
+            temperature = [temperature]
 
-        print(f"Transcribe with {model_name} model for the {LANGUAGES[language]} language...")
+        args = {
+            "language": language,
+            "patience": patience,
+            "suppress_tokens": suppress_tokens,
+            "initial_prompt": initial_prompt,
+            "condition_on_previous_text": condition_on_previous_text,
+            "compression_ratio_threshold": compression_ratio_threshold,
+            "logprob_threshold": logprob_threshold,
+            "no_speech_threshold": no_speech_threshold,
+            "fp16": True,
+            "verbose": False,
+            "word_timestamps": word_timestamps
+        }
+        with torch.inference_mode():
+            result = model.transcribe(str(audio), temperature=temperature, **args)
 
-        model = WhisperModel(
-            model_name,
-            device="cuda",
-            compute_type="float16",
-            download_root="whisper-cache",
-            local_files_only=True,
-        )
+        if transcription == "plain text":
+            transcription = result["text"]
+        elif transcription == "srt":
+            transcription = write_srt(result["segments"])
+        else:
+            transcription = write_vtt(result["segments"])
 
-        transcription, _ = model.transcribe(
-            str(audio_path),
-            language=language,
-            vad_filter=vad_filter,
-            vad_parameters=dict(
-                min_silence_duration_ms=500,
-            ),
-            word_timestamps=True,
-        )
-
-        segments = []
-        text = []
-        for segment in transcription:
-            print(f"{format_timestamp(segment.start)} --> {format_timestamp(segment.end)} {segment.text}")
-            text_segment = dict()
-            text_segment["end"] = segment.end
-            text_segment["start"] = segment.start
-            text_segment["text"] = segment.text
-            text_segment["words"] = []
-            
-            for word in segment.words:
-                words_segment = dict()
-                words_segment["start"] = word.start            	
-                words_segment["end"] = word.end
-                words_segment["word"] = word.word.strip()
-                text_segment["words"].append(words_segment)
-
-            segments.append(segment)
-            text.append(text_segment)
-            
-        audio_basename = os.path.basename(str(audio_path)).rsplit(".", 1)[0]
-
-        out_path_vtt = f"/tmp/{audio_basename}.{language}.vtt"
-        with open(out_path_vtt, "w", encoding="utf-8") as vtt:
-            vtt.write(generate_vtt(segments))
-
-        out_path_srt = f"/tmp/{audio_basename}.{language}.srt"
-        with open(out_path_srt, "w", encoding="utf-8") as srt:
-            srt.write(generate_srt(segments))
-
-        preview = " ".join([segment.text.strip() for segment in segments[:5]])
-        if len(preview) > 5:
-            preview += f"... (only the first 5 segments are shown, {len(segments) - 5} more segments in subtitles)"
+        if translate:
+            translation = model.transcribe(
+                str(audio), task="translate", temperature=temperature, **args
+            )
 
         return ModelOutput(
-            segments=text,
-            preview=preview,
-            srt_file=Path(out_path_srt),
-            vtt_file=Path(out_path_vtt),
+            segments=result["segments"],
+            detected_language=LANGUAGES[result["language"]],
+            transcription=transcription,
+            translation=translation["text"] if translate else None,
         )
 
 
-def format_timestamp(seconds: float, always_include_hours: bool = False):
-    assert seconds >= 0, "non-negative timestamp expected"
-    milliseconds = round(seconds * 1000.0)
-
-    hours = milliseconds // 3_600_000
-    milliseconds -= hours * 3_600_000
-
-    minutes = milliseconds // 60_000
-    milliseconds -= minutes * 60_000
-
-    seconds = milliseconds // 1_000
-    milliseconds -= seconds * 1_000
-
-    hours_marker = f"{hours}:" if always_include_hours or hours > 0 else ""
-    return f"{hours_marker}{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+def write_vtt(transcript):
+    result = ""
+    for segment in transcript:
+        result += f"{format_timestamp(segment['start'])} --> {format_timestamp(segment['end'])}\n"
+        result += f"{segment['text'].strip().replace('-->', '->')}\n"
+        result += "\n"
+    return result
 
 
-def generate_vtt(result: Iterable[Segment]):
-    vtt = "WEBVTT\n"
-    for segment in result:
-        vtt += f"{format_timestamp(segment.start)} --> {format_timestamp(segment.end)}\n"
-        vtt += f"{segment.text.replace('-->', '->')}\n"
-    return vtt
-
-
-def generate_srt(result: Iterable[Segment]):
-    srt = ""
-    for i, segment in enumerate(result, start=1):
-        srt += f"{i}\n"
-        srt += f"{format_timestamp(segment.start, always_include_hours=True)} --> {format_timestamp(segment.end, always_include_hours=True)}\n"
-        srt += f"{segment.text.strip().replace('-->', '->')}\n"
-    return srt
+def write_srt(transcript):
+    result = ""
+    for i, segment in enumerate(transcript, start=1):
+        result += f"{i}\n"
+        result += f"{format_timestamp(segment['start'], always_include_hours=True, decimal_marker=',')} --> "
+        result += f"{format_timestamp(segment['end'], always_include_hours=True, decimal_marker=',')}\n"
+        result += f"{segment['text'].strip().replace('-->', '->')}\n"
+        result += "\n"
+    return result
