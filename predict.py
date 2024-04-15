@@ -16,7 +16,7 @@ from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
 from whisper.utils import format_timestamp
 
 
-class ModelOutput(BaseModel):
+class Output(BaseModel):
     detected_language: str
     transcription: str
     segments: Any
@@ -99,7 +99,7 @@ class Predictor(BasePredictor):
             default=True,
             description="Improves the accuracy of the timestamps by using word-level timestamps",
         )
-    ) -> ModelOutput:
+    ) -> Output:
         """Transcribes and optionally translates a single audio file"""
         print(f"Transcribe with {model} model")
         model = self.model
@@ -138,7 +138,7 @@ class Predictor(BasePredictor):
                 str(audio), task="translate", temperature=temperature, **args
             )
 
-        return ModelOutput(
+        return Output(
             segments=result["segments"],
             detected_language=LANGUAGES[result["language"]],
             transcription=transcription,
